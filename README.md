@@ -81,6 +81,7 @@ index=* host="Win11-target" source="WinEventLog:Security" EventCode=4625
 
 ![SMB brute-force detection](./p1_05_bruteforce_detection.png.png)
    ![Triggered alert](./p1_08_triggered_alerts.png.png)
+   ![SOC Brute Force Monitor dashboard](./p1_09_brute_force_dashboard.png)
 
 ### 3. Tune
 
