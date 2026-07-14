@@ -79,8 +79,8 @@ index=* host="Win11-target" source="WinEventLog:Security" EventCode=4625
 
 **Validated result:** source `10.10.20.101`, 6 failed attempts against `administrator`, entire burst under one second — an automation signature no human produces. Saved as a scheduled alert (severity High) that fires into the Triggered Alerts queue.
 
-![SMB brute-force detection](./screenshots/p1_05_bruteforce_detection.png)
-![Triggered alert](./screenshots/p1_08_triggered_alerts.png)
+![SMB brute-force detection](./p1_05_bruteforce_detection.png.png)
+   ![Triggered alert](./p1_08_triggered_alerts.png.png)
 
 ### 3. Tune
 
