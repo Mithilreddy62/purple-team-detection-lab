@@ -1,0 +1,38 @@
+title: SMB/RDP Brute Force - Failed Logon Burst
+id: 8a1f4b2c-3d6e-4a7b-9c1d-2e5f8a0b3c4d
+status: experimental
+description: >
+  Detects a brute-force / password-guessing attempt against a Windows host by
+  correlating a burst of failed logon events (Event ID 4625) from a single
+  source address. Validated in a segmented purple-team lab against a Windows 11
+  target using NetExec SMB password guessing.
+author: Mithil Pashapu
+date: 2026/07/14
+references:
+  - https://attack.mitre.org/techniques/T1110/001/
+  - https://learn.microsoft.com/en-us/windows/security/threat-protection/auditing/event-4625
+logsource:
+  product: windows
+  service: security
+detection:
+  selection:
+    EventID: 4625
+  timeframe: 5m
+  condition: selection | count() by SourceNetworkAddress > 5
+fields:
+  - SourceNetworkAddress
+  - TargetUserName
+  - LogonType
+  - WorkstationName
+falsepositives:
+  - Users repeatedly mistyping passwords
+  - Service accounts with stale/expired credentials
+  - Vulnerability scanners or automated login testing
+level: high
+tags:
+  - attack.credential-access
+  - attack.t1110
+  - attack.t1110.001
+  - attack.lateral-movement
+  - attack.t1021.001
+  - attack.t1021.002
