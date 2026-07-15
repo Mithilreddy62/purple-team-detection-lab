@@ -1,0 +1,48 @@
+title: TCP Connection Permitted Through Firewall
+id: 8f3d1a92-5c7e-4b21-9e64-2d8a7f1c3b05
+status: experimental
+description: Base event for TCP traffic passed by the pfSense filter engine.
+author: Mithil Pashapu
+date: 2026-07-15
+logsource:
+  category: firewall
+  product: pfsense
+detection:
+  selection:
+    action: 'pass'
+    proto: 'tcp'
+  condition: selection
+falsepositives:
+  - Normal network traffic
+level: informational
+tags:
+  - attack.discovery
+---
+title: Network Service Discovery via TCP Port Scan
+id: 2b9c4e17-6a83-4f5d-b012-9c7e3a1d8f46
+status: experimental
+description: >
+  Detects a single source contacting a high number of distinct destination ports
+  on one host in a short window, consistent with an Nmap-style TCP port scan.
+  Detection is cardinality-based rather than volume-based because firewall log
+  fidelity degrades under scan bursts.
+author: Mithil Pashapu
+date: 2026-07-15
+correlation:
+  type: value_count
+  rules:
+    - 8f3d1a92-5c7e-4b21-9e64-2d8a7f1c3b05
+  group-by:
+    - src_ip
+    - dest_ip
+  timespan: 5m
+  condition:
+    gte: 50
+    field: dest_port
+falsepositives:
+  - Authorized vulnerability scanners
+  - Network inventory and monitoring systems
+level: medium
+tags:
+  - attack.discovery
+  - attack.t1046
