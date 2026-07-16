@@ -1,0 +1,249 @@
+# Purple Team Detection Lab
+
+> A self-built, network-segmented lab where offensive techniques are executed, detected in a SIEM, and tuned — every attack paired with its detection and mapped to MITRE ATT&CK.
+
+![Platform](https://img.shields.io/badge/SIEM-Splunk-black)
+![Detections](https://img.shields.io/badge/Detections--as--Code-Sigma-blue)
+![Framework](https://img.shields.io/badge/Mapped%20to-MITRE%20ATT%26CK-red)
+
+## What this project demonstrates
+
+I built an isolated, firewall-segmented lab to practice **detection engineering** end-to-end: run a real attack, capture the telemetry it generates, write a detection for it, validate the alert fires, then tune out the noise. The detections are version-controlled as code (Sigma) and mapped to MITRE ATT&CK techniques.
+
+The goal is to show the full purple-team loop — not just "I have a SIEM," but **attack executed → raw event → detection logic → alert firing → tuning decision** — for each technique.
+
+Each worked example deliberately uses a **different telemetry source**: endpoint logs for one, network firewall logs for the other.
+
+## Lab architecture
+
+```mermaid
+flowchart LR
+    subgraph LAN["LAN — 10.10.20.0/24"]
+        KALI["Kali Linux<br/>10.10.20.101<br/>Splunk Enterprise (SIEM)<br/>+ Attacker toolkit"]
+        WIN["Windows 11<br/>10.10.20.102<br/>Splunk Universal Forwarder<br/>WinEventLog://Security"]
+    end
+    subgraph DMZ["DMZ — 10.10.10.0/24"]
+        META["Metasploitable 2<br/>10.10.10.101<br/>Vulnerable target"]
+    end
+    PF["pfSense<br/>Firewall / Segmentation"]
+    KALI --- PF
+    WIN --- PF
+    PF --- META
+    WIN -. "forwards Windows Security logs" .-> KALI
+    PF -. "syslog UDP:514" .-> KALI
+```
+
+| Component | Role | Address |
+| --- | --- | --- |
+| pfSense | Firewall, network segmentation (LAN / DMZ), syslog source | gateway |
+| Kali Linux | SIEM host (Splunk Enterprise) + attacker box | 10.10.20.101 |
+| Windows 11 | Detection target; Splunk Universal Forwarder shipping `WinEventLog://Security` | 10.10.20.102 |
+| Metasploitable 2 | Deliberately vulnerable target in the DMZ | 10.10.10.101 |
+
+**Stack:** Splunk Enterprise · Splunk Universal Forwarder · Sigma · sigma-cli · MITRE ATT&CK · pfSense · NetExec · Nmap
+
+> Splunk UI: `http://10.10.20.101:8000`
+
+## Detection catalog
+
+| # | Technique | ATT&CK ID | Data source | Detection | Status |
+| --- | --- | --- | --- | --- | --- |
+| 1 | SMB Brute Force | T1110.001 | Windows Security (4625) | `smb_bruteforce.yml` | ✅ Firing |
+| 2 | Network Service Discovery | T1046 | pfSense firewall logs | `nmap_port_scan.yml` | ✅ Firing |
+| 3 | RDP Brute Force | T1110.001 · T1021.001 | Windows Security (4625, Logon Type 10) | `rdp_bruteforce.yml` | 🚧 Planned |
+| 4 | ARP Cache Poisoning (AiTM) | T1557.002 | Network / pfSense | `arp_spoof.yml` | 🚧 Planned |
+
+---
+
+## Worked example 1: SMB brute force (attack → detect → tune)
+
+**Data source:** Windows Security events · **ATT&CK:** [T1110.001](https://attack.mitre.org/techniques/T1110/001/) · **Severity:** High
+
+### 1. Attack
+
+Password guessing against SMB on the Windows 11 host using **NetExec (`nxc`)** — Windows 11 negotiates SMBv2/3, which Hydra's SMB module doesn't handle cleanly, so NetExec is the correct tool.
+
+```bash
+nxc smb 10.10.20.102 -u administrator -p wordlist.txt
+```
+
+Each failed attempt generates **Event ID 4625** on the target. *(Test credentials are intentionally not published.)*
+
+### 2. Detect
+
+The core detection counts failed logons per source over a short window:
+
+```
+index=* host="Win11-target" source="WinEventLog:Security" EventCode=4625
+| stats count AS failed_attempts,
+        values(Account_Name) AS targeted_accounts,
+        min(_time) AS first_attempt,
+        max(_time) AS last_attempt
+        by Source_Network_Address
+| where failed_attempts > 5
+| sort - failed_attempts
+```
+
+**Validated result:** source `10.10.20.101`, 6 failed attempts against `administrator`, entire burst under one second — an automation signature no human produces. Saved as a scheduled alert (severity High) that fires into the Triggered Alerts queue.
+
+![SMB brute-force detection](./p1_05_bruteforce_detection.png.png)
+![Triggered alert](./p1_08_triggered_alerts.png.png)
+![SOC Brute Force Monitor dashboard](./p1_09_brute_force_dashboard.png)
+
+### 3. Tune
+
+Field names differ by ingestion path — the same data surfaces under different names depending on how it was onboarded (`Source_Network_Address` / `Account_Name`), so the rule ships in two SPL variants to fire regardless. The sub-second burst window also enables rate-based logic to separate automated brute force from a user mistyping a password.
+
+---
+
+## Worked example 2: Nmap port scan (attack → detect → tune)
+
+**Data source:** pfSense firewall logs (syslog → Splunk) · **ATT&CK:** [T1046](https://attack.mitre.org/techniques/T1046/) · **Rule:** [`rules/nmap_port_scan.yml`](./rules/nmap_port_scan.yml) · **Severity:** Medium
+
+The SMB example detects an attack using endpoint telemetry. This one deliberately uses a different source — network firewall logs — for an attack that leaves no trace on the endpoint at all.
+
+### 1. Attack
+
+Nmap TCP SYN scan from Kali (LAN) against Metasploitable 2 (DMZ), crossing pfSense:
+
+```bash
+sudo nmap -sS -p 1-1000 10.10.10.101
+```
+
+1000 ports probed in 3.3 seconds; 12 open services identified (ftp, telnet, smtp, netbios-ssn, microsoft-ds, and the r-services on 512/513/514).
+
+**Why the scan had to cross segments.** Kali and the Windows target share the 10.10.20.0/24 LAN, so pfSense never sees traffic between them (see Engineering findings below). Scanning the DMZ host forces traffic through the firewall, making it visible. The lab's own topology limitation dictated the target choice.
+
+![Nmap scan](./p2_02_nmap_scan.png)
+
+### 2. Build the pipeline
+
+pfSense has no Splunk forwarder — it ships logs via syslog:
+
+1. Splunk UDP:514 input, sourcetype `pfsense`
+2. pfSense → Status → System Logs → Settings → Remote Logging → `10.10.20.101:514`, Firewall Events only
+3. **Enable logging on the LAN allow rule**
+
+Step 3 is the one that matters. pfSense logs its default *deny* rule automatically but ships allow rules with logging **off**. The Nmap scan is *permitted* traffic, so with default settings the firewall passes all 1000 packets and writes nothing.
+
+**A firewall having visibility of traffic and a firewall recording it are two different things.**
+
+![pfSense syslog in Splunk](./p2_01_pfsense_syslog_splunk.png)
+
+### 3. Parse
+
+Splunk indexes pfSense `filterlog` events as unstructured text — no `src_ip`, no `dest_port`, no `action`. Fields are extracted at search time against pfSense's documented CSV field order:
+
+```
+index=main sourcetype=pfsense filterlog
+| rex "filterlog\[\d+\]:\s(?<rule>[^,]*),(?<sub_rule>[^,]*),(?<anchor>[^,]*),(?<tracker>[^,]*),(?<iface>[^,]*),(?<reason>[^,]*),(?<action>[^,]*),(?<direction>[^,]*),(?<ip_ver>[^,]*),(?<tos>[^,]*),(?<ecn>[^,]*),(?<ttl>[^,]*),(?<id>[^,]*),(?<offset>[^,]*),(?<flags>[^,]*),(?<proto_id>[^,]*),(?<proto>[^,]*),(?<length>[^,]*),(?<src_ip>[^,]*),(?<dest_ip>[^,]*),(?<src_port>[^,]*),(?<dest_port>[^,]*)"
+| table _time, action, proto, src_ip, src_port, dest_ip, dest_port
+```
+
+This keeps the detection self-contained — it runs against raw ingestion without requiring the pfSense TA to be installed first.
+
+![Parsed pfSense events](./p2_03_pfsense_parsed.png)
+
+### 4. Detect
+
+```
+index=main sourcetype=pfsense filterlog
+| rex "<field extraction as above>"
+| search proto=tcp
+| stats dc(dest_port) as unique_ports, count as total_packets,
+        min(_time) as first_seen, max(_time) as last_seen by src_ip, dest_ip
+| eval duration_sec=round(last_seen-first_seen,2)
+| eval ports_per_sec=round(unique_ports/(duration_sec+1),1)
+| where unique_ports > 50
+| convert ctime(first_seen), ctime(last_seen)
+| sort - unique_ports
+```
+
+No individual packet is malicious. The detection is behavioural: how many *distinct* destination ports did a single source touch on a single host? Normal clients touch a handful.
+
+**Validated result:** 186 unique ports, 218 packets, `10.10.20.101` → `10.10.10.101`.
+
+Saved as a scheduled alert at **Medium** severity — a port scan is an adversary *looking*, not an adversary *in*. The SMB brute force is High because it is an access attempt. Grading every detection High trains analysts to ignore the queue.
+
+![Detection firing](./p2_04_pfsense_parsed.png)
+![Alert saved](./p2_05_alert_saved.png)
+
+A secondary indicator visible in the parsed data: `src_port` stayed fixed at 42996 across every probe while `dest_port` varied randomly. A normal TCP client draws a fresh ephemeral source port per connection; Nmap's SYN scan reuses one raw socket. Viable as a detection on its own.
+
+### 5. Tune — why the threshold counts ports, not packets
+
+Nmap sent **1000** probes. Splunk indexed **~186**. Roughly 80% of the scan was never logged.
+
+The loss was isolated with a packet capture on the Splunk host, run while the scan executed:
+
+```bash
+sudo tcpdump -i eth0 -n udp port 514 | wc -l
+# 114 packets captured, 0 packets dropped by kernel
+```
+
+Only ~114 syslog datagrams crossed the wire against 1000 probes — and some of those were unrelated background traffic. This rules out the two obvious suspects: **UDP transport loss and Splunk's receive buffer are both exonerated**, because the packets never left pfSense to begin with.
+
+**The loss occurs inside pfSense, before the log becomes a log.**
+
+Mechanism is consistent with `pflog0` buffer overflow — pfSense writes matched packets to a fixed-size BPF device that the `filterlog` daemon drains, and at ~300 packets/second the buffer fills faster than it can be read, with the excess discarded silently. This is an inference from the isolation test, not a directly measured cause; `netstat -B` on the pfSense shell would confirm it via per-device drop counters.
+
+The firewall **enforced** all 1000 packets correctly. It only **narrated** about 11% of them.
+
+No downstream fix recovers this — TCP syslog, TLS, or a disk-buffering collector would all inherit the same loss, because it happens at the source. The pipeline's fidelity degrades precisely when an attack is loudest. This directly shaped the rule:
+
+| Approach | Behaviour under ~80% log loss |
+| --- | --- |
+| `dc(dest_port) > 50` — cardinality | **Fires.** 186 distinct ports still clears the threshold |
+| `count > 900` — volume | **Silent.** Sees 218 packets, misses the scan entirely |
+
+Cardinality-based thresholds degrade gracefully under sampling; volume-based thresholds do not. A threshold tuned against the *attack's* true rate rather than the *pipeline's* observed rate is a rule that fails when it matters.
+
+### 6. Detection-as-code
+
+`rules/nmap_port_scan.yml` is a two-document Sigma rule: a base event rule for permitted TCP traffic, and a `value_count` correlation over it grouped by source/destination.
+
+```
+$ sigma check rules/nmap_port_scan.yml
+Found 0 errors, 0 condition errors and 0 issues.
+
+$ sigma convert -t splunk --without-pipeline rules/nmap_port_scan.yml
+action="pass" proto="tcp"
+| bin _time span=5m
+| stats dc(dest_port) as value_count by _time src_ip dest_ip
+| search value_count >= 50
+```
+
+Validates clean and compiles. Two honest caveats on the compiled output:
+
+**No pfSense pipeline exists.** `sigma list pipelines splunk` returns only `splunk_windows`, `splunk_sysmon_acceleration`, and `splunk_cim` — all Windows or CIM. Conversion requires `--without-pipeline`, which passes field names through verbatim. The compiled query works here only because the `rex` extractions were named to match. **Sigma expresses detection logic; it does not express field extraction.** Run the compiled query against raw pfSense ingestion and it returns zero events, because `action` and `dest_port` do not exist until `rex` creates them. Anyone reusing this rule must supply their own parsing.
+
+**Tumbling vs. sliding windows.** `bin _time span=5m` buckets on fixed clock boundaries, so a scan straddling a boundary is split across two buckets and each half may fall below the threshold. Sigma's `timespan` cannot express a sliding window. The hand-written SPL has no `bin` and is not subject to this.
+
+Both queries ship: the compiled one demonstrates portability, the hand-written one is the implementation that runs.
+
+> `temporal_ordered` correlation is unsupported by the Splunk backend; `value_count` is supported. The limitation is per-correlation-type, not general.
+
+---
+
+## Engineering findings
+
+- **Firewall log fidelity collapses under scan bursts.** ~89% of a 1000-port Nmap scan was never logged by pfSense — isolated via packet capture to the firewall itself, not the transport. Detections must use thresholds that survive sampling. *(Full analysis in Worked example 2.)*
+- **A firewall seeing traffic and recording it are different things.** pfSense allow rules ship with logging disabled by default; permitted attack traffic is silent until logging is explicitly enabled.
+- **Sigma expresses logic, not parsing.** A rule that validates and compiles cleanly still returns zero events without field extraction the consumer must supply.
+- **Field-name normalization matters.** Identical events surface under different field names depending on ingestion path; detections must account for both or they silently fail.
+- **Segmentation only works if hosts are actually segmented.** Attacker (Kali) and target (Win11) share a subnet, so pfSense never sees the intra-subnet traffic. *Fix in progress:* relocate the Windows target to the DMZ so its traffic traverses the firewall.
+- **Tool choice is dictated by the target.** Hydra's SMB module fails against Windows 11's SMBv2/3; NetExec is the right tool.
+
+## Repository structure
+
+```
+├── rules/          # Sigma detection rules
+├── *.png           # Attack, detection, and alert evidence
+└── README.md
+```
+
+## About
+
+Built by **Mithil Pashapu** — M.S. Cybersecurity (Florida Atlantic University). Detection engineering / SOC / purple team.
+
+- GitHub: [Mithilreddy62](https://github.com/Mithilreddy62)
