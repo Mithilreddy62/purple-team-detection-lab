@@ -1,0 +1,63 @@
+# Two-document Sigma rule: a base event rule for permitted TCP traffic,
+# and a value_count correlation over it grouped by source/destination.
+# Detects horizontal port scanning by counting distinct destination ports
+# a single source touches on a single host within a short window.
+title: Permitted TCP Traffic (pfSense)
+name: pfsense_permitted_tcp
+id: 840eb1e7-acbb-4243-898f-aecf913122f6
+status: experimental
+description: Base rule matching permitted (passed) TCP packets in pfSense filterlog. Not an alert on its own; feeds the port-scan correlation below.
+references:
+    - https://attack.mitre.org/techniques/T1046/
+author: Mithil Pashapu
+date: 2026/07/17
+logsource:
+    product: pfsense
+    service: filterlog
+detection:
+    selection:
+        action: pass
+        proto: tcp
+    condition: selection
+fields:
+    - src_ip
+    - dest_ip
+    - dest_port
+falsepositives:
+    - Normal client traffic (filtered out by the correlation threshold, not here)
+level: informational
+tags:
+    - attack.discovery
+    - attack.t1046
+---
+title: Network Service Discovery - TCP Port Scan
+id: 99f2dd78-7af4-4f26-8726-0fba2c03d132
+status: experimental
+description: |
+    Detects a single source touching an unusually high number of distinct
+    destination ports on one host in a short window - the behavioural
+    signature of a TCP port scan (e.g. nmap -sS). No individual packet is
+    malicious; the detection is cardinality-based, which degrades gracefully
+    under the ~80% log loss pfSense exhibits during scan bursts.
+references:
+    - https://attack.mitre.org/techniques/T1046/
+author: Mithil Pashapu
+date: 2026/07/17
+correlation:
+    type: value_count
+    rules:
+        - pfsense_permitted_tcp
+    group-by:
+        - src_ip
+        - dest_ip
+    timespan: 5m
+    condition:
+        gte: 50
+        field: dest_port
+falsepositives:
+    - Vulnerability scanners (Nessus, OpenVAS) run by the security team
+    - Legitimate network inventory / service discovery tooling
+level: medium
+tags:
+    - attack.discovery
+    - attack.t1046
